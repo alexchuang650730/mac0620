@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""
+Trae Message Sender (指令3)
+向Trae對話框發送消息並確認記錄到對話歷史
+
+用法: trae-send <倉庫名稱> <消息內容> [選項]
+"""
+
+import os
+import sys
+import json
+import sqlite3
+import subprocess
+import argparse
+import time
+from datetime import datetime
+from pathlib import Path
+
+class TraeMessageSender:
+    def __init__(self):
+        self.ssh_config = {
+            "host": "serveo.net",
+            "port": 41269, 
+            "user": "alexchuang",
+            "password": "123456"
+        }
+        self.trae_db_path = "/Users/alexchuang/Library/Application Support/Trae/User/workspaceStorage/f002a9b85f221075092022809f5a075f/state.vscdb"
+        self.base_dir = "/home/alexchuang/aiengine/trae/git"
+    
+    def ssh_execute(self, command):
+        """通過SSH執行命令"""
+        try:
+            ssh_cmd = [
+                "sshpass", "-p", self.ssh_config["password"],
+                "ssh", "-o", "StrictHostKeyChecking=no",
+                "-p", str(self.ssh_config["port"]),
+                f"{self.ssh_config['user']}@{self.ssh_config['host']}",
+                command
+            ]
+            
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30)
+            return result.returncode == 0, result.stdout, result.stderr
+            
+        except Exception as e:
+            return False, "", str(e)
+    
+    def get_conversation_count_before(self):
+        """獲取發送消息前的對話數量"""
+        sql_query = f'''
+        sqlite3 "{self.trae_db_path}" "
+        SELECT COUNT(*) FROM ItemTable 
+        WHERE key LIKE '%input-history%' OR key LIKE '%memento%';
+        "
+        '''
+        
+        success, output, error = self.ssh_execute(sql_query)
+        if success and output.strip().isdigit():
+            return int(output.strip())
+        return 0
+    
+    def send_message_to_trae(self, repo_name, message):
+        """向Trae發送消息"""
+        print(f"📤 正在向倉庫 '{repo_name}' 發送消息...")
+        print(f"💬 消息內容: {message}")
+        
+        # 獲取發送前的對話數量
+        count_before = self.get_conversation_count_before()
+        print(f"📊 發送前對話記錄數: {count_before}")
+        
+        # 構造發送消息的命令
+        # 這裡使用AppleScript來操作Trae應用
+        applescript = f'''
+        tell application "Trae"
+            activate
+            delay 1
+            
+            -- 嘗試找到輸入框並發送消息
+            tell application "System Events"
+                -- 等待應用加載
+                delay 2
+                
+                -- 查找輸入框 (可能需要根據實際UI調整)
+                try
+                    -- 方法1: 直接輸入文本
+                    keystroke "{message}"
+                    delay 1
+                    keystroke return
+                    
+                    -- 或者方法2: 使用UI元素
+                    -- click text field 1 of window 1 of application process "Trae"
+                    -- keystroke "{message}"
+                    -- keystroke return
+                on error
+                    -- 如果直接輸入失敗，嘗試其他方法
+                    key code 36 -- Enter key
+                end try
+            end tell
+        end tell
+        '''
+        
+        # 將AppleScript保存到臨時文件
+        script_file = "/tmp/trae_send_message.scpt"
+        applescript_command = f'''
+        cat > {script_file} << 'EOF'
+{applescript}
+EOF
+        '''
+        
+        success, output, error = self.ssh_execute(applescript_command)
+        if not success:
+            print(f"❌ 創建AppleScript失敗: {error}")
+            return False
+        
+        # 執行AppleScript
+        execute_command = f"osascript {script_file}"
+        success, output, error = self.ssh_execute(execute_command)
+        
+        if not success:
+            print(f"❌ 執行AppleScript失敗: {error}")
+            # 嘗試備用方法：直接操作剪貼板
+            return self.send_via_clipboard(message)
+        
+        print("✅ 消息已發送到Trae")
+        return True
+    
+    def send_via_clipboard(self, message):
+        """通過剪貼板發送消息的備用方法"""
+        print("🔄 嘗試通過剪貼板發送消息...")
+        
+        clipboard_script = f'''
+        echo "{message}" | pbcopy
+        
+        osascript -e '
+        tell application "Trae"
+            activate
+        end tell
+        
+        tell application "System Events"
+            delay 2
+            keystroke "v" using command down
+            delay 1
+            keystroke return
+        end tell
+        '
+        '''
+        
+        success, output, error = self.ssh_execute(clipboard_script)
+        
+        if success:
+            print("✅ 消息已通過剪貼板發送")
+            return True
+        else:
+            print(f"❌ 剪貼板發送失敗: {error}")
+            return False
+    
+    def verify_message_recorded(self, repo_name, message, count_before, max_wait=30):
+        """驗證消息是否已記錄到對話歷史"""
+        print("🔍 正在驗證消息是否已記錄...")
+        
+        start_time = time.time()
+        
+        while time.time() - start_time < max_wait:
+            # 檢查對話記錄數量是否增加
+            count_after = self.get_conversation_count_before()
+            
+            if count_after > count_before:
+                print(f"📊 發送後對話記錄數: {count_after}")
+                
+                # 查詢最新的對話記錄
+                sql_query = f'''
+                sqlite3 "{self.trae_db_path}" "
+                SELECT value FROM ItemTable 
+                WHERE key LIKE '%input-history%' OR key LIKE '%memento%'
+                ORDER BY rowid DESC LIMIT 5;
+                "
+                '''
+                
+                success, output, error = self.ssh_execute(sql_query)
+                
+                if success:
+                    # 檢查是否包含我們發送的消息
+                    if message.lower() in output.lower():
+                        print("✅ 消息已成功記錄到對話歷史")
+                        return True
+            
+            time.sleep(2)
+        
+        print("⚠️ 無法確認消息是否已記錄，可能需要手動檢查")
+        return False
+    
+    def save_send_log(self, repo_name, message, success, verification_result):
+        """保存發送日誌"""
+        log_dir = Path(self.base_dir) / repo_name / "history"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "repository": repo_name,
+            "message": message,
+            "send_success": success,
+            "verification_success": verification_result,
+            "action": "message_sent"
+        }
+        
+        # 保存到發送日誌文件
+        log_file = log_dir / "send_log.jsonl"
+        
+        try:
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            
+            print(f"📝 發送日誌已保存: {log_file}")
+            
+        except Exception as e:
+            print(f"⚠️ 保存發送日誌失敗: {e}")
+    
+    def send_message(self, repo_name, message):
+        """執行消息發送流程"""
+        print(f"🚀 開始向倉庫 '{repo_name}' 發送消息")
+        print("=" * 50)
+        
+        # 檢查倉庫是否存在
+        repo_path = Path(self.base_dir) / repo_name
+        if not repo_path.exists():
+            print(f"❌ 倉庫目錄不存在: {repo_path}")
+            return False
+        
+        # 獲取發送前的對話數量
+        count_before = self.get_conversation_count_before()
+        
+        # 發送消息
+        send_success = self.send_message_to_trae(repo_name, message)
+        
+        if not send_success:
+            print("❌ 消息發送失敗")
+            self.save_send_log(repo_name, message, False, False)
+            return False
+        
+        # 等待並驗證消息記錄
+        verification_result = self.verify_message_recorded(repo_name, message, count_before)
+        
+        # 保存發送日誌
+        self.save_send_log(repo_name, message, send_success, verification_result)
+        
+        if verification_result:
+            print("🎉 消息發送並記錄成功!")
+        else:
+            print("⚠️ 消息已發送，但無法確認記錄狀態")
+        
+        return send_success
+    
+    def list_repositories(self):
+        """列出可用倉庫"""
+        git_dir = Path(self.base_dir)
+        if not git_dir.exists():
+            return []
+        
+        repos = [d.name for d in git_dir.iterdir() if d.is_dir()]
+        return repos
+
+def main():
+    parser = argparse.ArgumentParser(description="Trae Message Sender")
+    parser.add_argument("repo_name", nargs="?", help="倉庫名稱")
+    parser.add_argument("message", nargs="?", help="要發送的消息")
+    parser.add_argument("--list", "-l", action="store_true", help="列出可用倉庫")
+    parser.add_argument("--test", "-t", action="store_true", help="發送測試消息")
+    
+    args = parser.parse_args()
+    
+    sender = TraeMessageSender()
+    
+    if args.list:
+        repos = sender.list_repositories()
+        print("📋 可用倉庫:")
+        for repo in repos:
+            print(f"   📁 {repo}")
+        return
+    
+    if args.test:
+        if not args.repo_name:
+            print("❌ 測試模式需要指定倉庫名稱")
+            return
+        
+        test_message = f"測試消息 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        success = sender.send_message(args.repo_name, test_message)
+        sys.exit(0 if success else 1)
+    
+    if not args.repo_name or not args.message:
+        print("❌ 請指定倉庫名稱和消息內容")
+        parser.print_help()
+        return
+    
+    # 發送指定消息
+    success = sender.send_message(args.repo_name, args.message)
+    sys.exit(0 if success else 1)
+
+if __name__ == "__main__":
+    main()
+
